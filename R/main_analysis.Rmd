@@ -1,0 +1,1797 @@
+---
+title: "Disease pyramid"
+subtitle: "Main analysis"
+author: "Matan Markfeld"
+date: "Last edit: 2026-08-24"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    collapse: false
+    number_sections: true
+    code_folding: hide
+    highlight: tango
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(results = "asis", message=FALSE, warning=FALSE, cache=TRUE, eval = TRUE, dev = c('png'), out.width = '100%', out.height='100%')
+```
+
+
+```{r load libraries, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(magrittr)
+library(ggplot2)
+library(tidytext)
+library(vegan)
+library(reshape2)
+library(RColorBrewer)
+library(correlation)
+library(car)
+library(Hmsc)
+library(ggtext)
+library(patchwork)
+library(betareg)
+library(MuMIn)
+library(scales)
+
+rm(list=ls())
+```
+
+# Data
+
+```{r}
+# data
+data_parasites <- read_csv("../data/data_processed/parasites_wide_10_lulu.csv")
+data_parasites_long <- read_csv("../data/data_processed/parasites_long_10_lulu.csv") 
+  
+data_x <- read_csv("../data/data_processed/data_x_final.csv")
+data_rand <- read_csv("../data/data_processed/data_rand_final.csv")
+
+# host species
+host_sp <- c("Rattus rattus", "Microgale brevicaudata")
+
+# parasite taxonomic group colors
+tax_colors <- c(
+  "Nematode" = "#023e8a",
+  "Protozoa" = "#7f5539"
+)
+
+# posterior-support thresholds used throughout (an effect is "supported" when the
+# posterior probability of its sign is >= post_top or <= post_bottom)
+post_top <- 0.9
+post_bottom <- 0.1
+
+# helper to save any ggplot as a high-resolution, publication-ready PDF.
+# cairo_pdf embeds fonts and renders ggtext (element_markdown) labels correctly.
+# To export a figure, uncomment its save_fig() line below the plot.
+save_fig <- function(plot, file, width = 7, height = 7, ...) {
+  dir.create(dirname(file), showWarnings = FALSE, recursive = TRUE)
+  ggplot2::ggsave(file, plot = plot, device = grDevices::cairo_pdf,
+                  width = width, height = height, dpi = 300,
+                  units = "in", ...)
+  invisible(file)
+}
+```
+
+
+# Pre-analysis
+
+## Filtering the data
+```{r}
+# transforming parasite data (Y) into a matrix
+data_parasites_mat <- data_parasites %>% 
+  select(-host_species,-village,-grid) %>% 
+  column_to_rownames("host_ID") %>% 
+  as.matrix()
+
+# X table
+col_scale <- c("dist_village")
+
+data_x_final <- data_x %>% 
+  select(host_ID, host_species, sex, size_z, BCI, dist_village, season, shannon_scaled, uniqueness_scaled, FB_z) %>% 
+  mutate(sex = as.factor(sex), season = as.factor(season), host_species = as.factor(host_species)) %>% 
+  mutate(across(all_of(col_scale), ~ as.numeric(scale(.x)))) %>%  # scaling only variables in col_scale to mean=0, sd=1
+  column_to_rownames("host_ID")
+
+# random table
+data_rand_final <- data_rand %>% 
+  select(host_ID, village, site) %>% 
+  mutate(host_ID = as.factor(host_ID), village = as.factor(village), site = as.factor(site)) %>% 
+  dplyr::rename(individual=host_ID) %>% 
+  as.data.frame()
+
+# set rownames from the (renamed) individual column, not the dropped host_ID
+rownames(data_rand_final) <- as.character(data_rand_final$individual)
+
+# force BOTH X and the study design to match the exact row order of Y.
+# The input files are not stored in the same order, so the study design must be
+# reordered too -- otherwise HMSC (which matches studyDesign to Y by position)
+# attaches the wrong site/individual to each host.
+data_x_final    <- data_x_final[match(rownames(data_parasites_mat), rownames(data_x_final)), , drop = FALSE]
+data_rand_final <- data_rand_final[match(rownames(data_parasites_mat), rownames(data_rand_final)), , drop = FALSE]
+
+# Sanity check: Y, X, and the study design must all share the same row order,
+# and the study design's individual key must equal the Y row identity.
+stopifnot(
+  all(rownames(data_parasites_mat) == rownames(data_x_final)),
+  all(rownames(data_parasites_mat) == rownames(data_rand_final)),
+  all(rownames(data_parasites_mat) == as.character(data_rand_final$individual))
+)
+print("Ready for HMSC! Y, X, and study design rows match perfectly.")
+```
+
+## Parasite metadata
+```{r}
+# parasite metadata
+parasite_metadata <- data_parasites_long %>% 
+  distinct(type, final_id)
+
+# --- parasite trait table (Tr) for HMSC ---
+# One trait: taxonomic type (Protozoa / Nematode). Protozoa is the reference
+# level, so the estimated trait contrast is "Nematode vs Protozoa".
+# TrData must have one row per parasite, in the SAME order as the Y columns.
+data_trait <- parasite_metadata %>% 
+  distinct(final_id, type) %>% 
+  mutate(type = factor(type, levels = c("Protozoa", "Nematode"))) %>%  # Protozoa = reference
+  as.data.frame()
+rownames(data_trait) <- data_trait$final_id
+
+# order trait rows to match the Y matrix columns exactly, then keep only the trait
+data_trait <- data_trait[colnames(data_parasites_mat), , drop = FALSE]
+stopifnot(all(rownames(data_trait) == colnames(data_parasites_mat)))
+data_trait$final_id <- NULL   # TrData must contain only the trait column(s)
+
+```
+
+
+## Correlations between variables
+
+```{r}
+data_x_cor <- data_x_final
+
+# pretty predictor names, in the exact column order of data_x_final
+recoding_names <- c(
+  "Host Species",
+  "Sex",
+  "Body Size",
+  "BCI",
+  "Land Use",
+  "Season",
+  "Microbiome Shannon",
+  "Microbiome Uniqueness",
+  "Microbiome FB"
+)
+
+colnames(data_x_cor) <- recoding_names
+
+# Calculate correlations (full matrix, mixed types -- used only for the heatmap)
+corr_results <- correlation(data_x_cor, method = "auto")
+
+# correlation summary on continuous predictors only
+# Pearson r on a comparable scale
+cont_vars <- c("Body Size", "BCI", "Land Use",
+               "Microbiome Shannon", "Microbiome Uniqueness", "Microbiome FB")
+corr_cont <- correlation(data_x_cor[, cont_vars], method = "pearson")
+
+cat("max:",  max(corr_cont$r, na.rm = TRUE), "\n")
+cat("min:",  min(corr_cont$r, na.rm = TRUE), "\n")
+cat("mean:", mean(abs(corr_cont$r), na.rm = TRUE), "\n")
+
+# Alphabetical variable order
+var_order <- sort(recoding_names)
+
+# Reorder each pair alphabetically so no pair is lost
+corr_plot_df <- corr_results %>%
+  mutate(
+    var1_order = match(Parameter1, var_order),
+    var2_order = match(Parameter2, var_order),
+    
+    x_var = if_else(var1_order < var2_order, Parameter1, Parameter2),
+    y_var = if_else(var1_order < var2_order, Parameter2, Parameter1),
+    
+    x_num = match(x_var, var_order),
+    y_num = match(y_var, var_order)
+  ) %>%
+  filter(x_num < y_num) %>%
+  mutate(
+    x_var = factor(x_var, levels = var_order),
+    y_var = factor(y_var, levels = var_order)
+  )
+
+# Plot upper triangle only
+g_corr <- ggplot(corr_plot_df, aes(x = x_var, y = y_var, fill = r)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "#6247aa",
+    high = "#d00000",
+    mid = "white",
+    midpoint = 0,
+    limits = c(-1, 1),
+    space = "Lab",
+    name = "Correlation"
+  ) +
+  geom_text(aes(label = round(r, 2)), color = "black", size = 2.5) +
+  coord_fixed() +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),
+    axis.text.y = element_text(angle = 0, color = "black"),
+    panel.grid = element_blank(),
+    #panel.border = element_blank(),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(
+    x = "Variable 1",
+    y = "Variable 2"
+  )
+
+# save_fig(g_corr, "../results/correlations.pdf", width = 6, height = 5)
+g_corr
+
+
+# --------------------------------------------------------------------
+# VIF (computed on the model predictors)
+
+vif_df <- data_x_final
+vif_df$dummy_response <- rnorm(nrow(vif_df))
+lm_vif <- lm(dummy_response ~ ., data = vif_df)
+
+cat("\nVIF (GVIF is reported for factor predictors):\n")
+print(round(car::vif(lm_vif), 2))
+```
+
+
+# HMSC analysis
+
+## HMSC function
+```{r}
+run_hmsc <- function(
+    Y,
+    X,
+    Tr = NULL,
+    studyDesign,
+    ranLevels,
+    XFormula,
+    TrFormula = NULL,
+    ranLevelsUsed = names(ranLevels),
+    nChains = 4,
+    samples = 1000,
+    thin = 10,
+    transient = 5000,
+    verbose = 100
+) {
+  
+  
+  # --------------------------------------------------------------------
+  # 1. Build model
+  # --------------------------------------------------------------------
+  message("Building HMSC model...")
+  
+  hmsc_args <- list(
+    Y = Y,
+    XData = X,
+    XFormula = XFormula,
+    distr = "probit",
+    XScale = FALSE,
+    studyDesign = studyDesign,
+    ranLevels = ranLevels,
+    ranLevelsUsed = ranLevelsUsed
+  )
+  # add the parasite trait model only when a trait is supplied
+  if (!is.null(Tr) && !is.null(TrFormula)) {
+    hmsc_args$TrData    <- Tr
+    hmsc_args$TrFormula <- TrFormula
+  }
+  model <- do.call(Hmsc, hmsc_args)
+  
+  # --------------------------------------------------------------------
+  # 2. MCMC sampling
+  # --------------------------------------------------------------------
+  message("Running MCMC... this may take a while.")
+  
+  set.seed(123)
+  model <- sampleMcmc(
+    model,
+    nChains = nChains,
+    samples = samples,
+    thin = thin,
+    transient = transient,
+    verbose = verbose,
+    nParallel = nChains
+  )
+  
+  # --------------------------------------------------------------------
+  # 3. Extract regression effects (Beta)
+  # --------------------------------------------------------------------
+  message("Extracting fixed effects (Beta)...")
+  postBeta <- getPostEstimate(model, parName = "Beta")
+  
+  # --------------------------------------------------------------------
+  # 4. Extract trait effects (Gamma)
+  # --------------------------------------------------------------------
+  message("Extracting trait effects (Gamma)...")
+  postGamma <- getPostEstimate(model, parName = "Gamma")
+  
+  # --------------------------------------------------------------------
+  # 5. Variance partitioning
+  # --------------------------------------------------------------------
+  message("Computing variance partitioning...")
+  vp <- computeVariancePartitioning(model)
+  
+  # --------------------------------------------------------------------
+  # 6. Parasite-parasite interactions (Omega)
+  # --------------------------------------------------------------------
+  message("Computing parasite-parasite associations (Omega)...")
+  Omega <- computeAssociations(model)
+  
+  # --------------------------------------------------------------------
+  # 7. Predictive performance
+  # --------------------------------------------------------------------
+  message("Evaluating predictive performance...")
+  
+  # --------------------------------------------------------------------
+  # A. Training fit
+  # --------------------------------------------------------------------
+  
+  preds_fit <- computePredictedValues(
+    hM = model,
+    nChains = length(model$postList),
+    start = 1,
+    thin = 1,
+    expected = TRUE
+  )
+  
+  eval_fit <- evaluateModelFit(
+    hM = model,
+    predY = preds_fit
+  )
+  
+  # --------------------------------------------------------------------
+  # B. Cross-validated prediction
+  # --------------------------------------------------------------------
+  
+  partition <- createPartition(
+    hM = model,
+    nfolds = 5,
+    column = "individual"  
+  )
+  
+  preds_cv <- computePredictedValues(
+    hM = model,
+    partition = partition,
+    nChains = length(model$postList),
+    nParallel = 4,
+    start = 1,
+    thin = 1,
+    expected = TRUE,
+    alignPost = TRUE
+  )
+  
+  eval_cv <- evaluateModelFit(
+    hM = model,
+    predY = preds_cv
+  )
+  
+  # --------------------------------------------------------------------
+  # 8. Convergence diagnostics 
+  # --------------------------------------------------------------------
+  message("Checking MCMC convergence...")
+  
+  post <- convertToCodaObject(model)
+  
+  # Effective sample sizes
+  ess <- list(
+    Beta  = effectiveSize(post$Beta),
+    Gamma = effectiveSize(post$Gamma),
+    V     = effectiveSize(post$V)
+  )
+  
+  # Gelman diagnostics
+  gelman <- list(
+    Beta  = gelman.diag(post$Beta,  multivariate = FALSE),
+    Gamma = gelman.diag(post$Gamma, multivariate = FALSE),
+    V     = gelman.diag(post$V,     multivariate = FALSE)
+  )
+  
+  # --------------------------------------------------------------------
+  # 9. Wrap everything into a list
+  # --------------------------------------------------------------------
+  message("Done.")
+  
+  return(list(
+    model = model,
+    Beta = postBeta,
+    Gamma = postGamma,
+    variance_partitioning = vp,
+    Omega = Omega,
+    predictive_performance = eval_cv,
+    fit_performance = eval_fit,
+    ESS = ess,
+    gelman = gelman
+  ))
+}
+
+```
+
+## Run HMSC
+```{r}
+# the model is expensive (hours). Only fit it if the saved results are
+# absent (or if force_refit is set). otherwise the load chunk below just reads
+# the saved object. This prevents knitting from silently re-running sampleMcmc
+# and overwriting the saved .rds.
+
+results_path <- "../data/data_results/hmsc_results_10_lulu_trait_dist.rds"
+force_refit  <- FALSE
+
+if (force_refit || !file.exists(results_path)) {
+
+  # random variables
+  rL_ind  <- HmscRandomLevel(units = as.factor(as.character(data_rand_final$individual)))
+  rL_site <- HmscRandomLevel(units = as.factor(as.character(data_rand_final$site)))
+
+  result_hmsc <- run_hmsc(
+    Y = data_parasites_mat,
+    X = data_x_final,
+    studyDesign = data_rand_final,
+    ranLevels = list(site = rL_site, individual = rL_ind),
+    XFormula = ~ sex + size_z + BCI + host_species*dist_village + season + shannon_scaled + uniqueness_scaled + FB_z,
+    Tr = data_trait,
+    TrFormula = ~ type,
+    ranLevelsUsed = c("site", "individual"),
+    nChains = 4,
+    samples = 1000,
+    thin = 250,
+    transient = 100000
+  )
+
+  saveRDS(result_hmsc, results_path)
+}
+```
+
+```{r}
+# loading the results
+result_hmsc <- readRDS(results_path)
+```
+
+## Predictive performance
+```{r}
+perf_fit <- result_hmsc$fit_performance
+perf_cv  <- result_hmsc$predictive_performance
+
+# per-parasite performance
+cat("AUC per parasite (fitted):\n");                 print(round(perf_fit$AUC, 3))
+cat("\nTjur's R2 per parasite (fitted):\n");         print(round(perf_fit$TjurR2, 3))
+cat("\nTjur's R2 per parasite (cross-validated):\n"); print(round(perf_cv$TjurR2, 3))
+
+# summaries
+cat(sprintf("\nFitted Tjur's R2: mean = %.3f, sd = %.3f, median = %.3f, range = [%.3f, %.3f]\n",
+            mean(perf_fit$TjurR2, na.rm = TRUE), sd(perf_fit$TjurR2, na.rm = TRUE),
+            median(perf_fit$TjurR2, na.rm = TRUE),
+            min(perf_fit$TjurR2, na.rm = TRUE), max(perf_fit$TjurR2, na.rm = TRUE)))
+cat(sprintf("CV     Tjur's R2: mean = %.3f, sd = %.3f, median = %.3f, range = [%.3f, %.3f]\n",
+            mean(perf_cv$TjurR2, na.rm = TRUE), sd(perf_cv$TjurR2, na.rm = TRUE),
+            median(perf_cv$TjurR2, na.rm = TRUE),
+            min(perf_cv$TjurR2, na.rm = TRUE), max(perf_cv$TjurR2, na.rm = TRUE)))
+
+df_perf <- data.frame(
+  final_id = colnames(data_parasites_mat),
+  tjur_cv = pmax(0.0001,perf_cv$TjurR2),
+  tjur_fit = perf_fit$TjurR2
+)
+
+# adding information to parasite metadata
+parasite_metadata %<>% left_join(df_perf, by="final_id") %>% 
+#  calculation of parasite weights
+  mutate(tjur_weight = sqrt(tjur_cv) / sum(sqrt(tjur_cv), na.rm = TRUE))
+
+# --------------------------------------------------------------------
+# Plotting
+
+# Convert from wide to long format
+df_perf_long <- df_perf %>%
+  left_join(parasite_metadata %>% select(final_id), by="final_id") %>% 
+  pivot_longer(
+    cols = starts_with("tjur_"),  # Selects tjur_cv and tjur_fit columns
+    names_to = "Metric",
+    values_to = "TjurR2"
+  ) %>%
+  # Clean up the Metric names for better legend/label readability
+  mutate(
+    Metric = case_when(
+      Metric == "tjur_cv" ~ "Cross-Validated",
+      Metric == "tjur_fit" ~ "Fitted",
+      TRUE ~ Metric
+    )
+  )
+
+
+# Prepare the labels
+lab_df <- parasite_metadata %>%
+  distinct(final_id, type)
+
+parasite_labels <- setNames(
+  paste0(
+    "<span style='color:", tax_colors[lab_df$type], "'>",
+    lab_df$final_id,
+    "</span>"
+  ),
+  lab_df$final_id
+)
+
+# plot
+g <- ggplot(df_perf_long, aes(x = final_id, y = TjurR2, fill = Metric)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.8) +
+  coord_flip() +
+  
+  # Map the OTU to colored HTML labels
+  scale_x_discrete(labels = parasite_labels) +
+  
+  scale_fill_manual(
+    values = c("Cross-Validated" = "#4895EF", "Fitted" = "#D1D5DB"),
+    name = "Performance"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_bw() +
+  theme(
+    axis.text.y = element_markdown(size = 10), 
+    text = element_text(size = 14),
+    axis.title = element_text(face = "bold", size = 16),
+    axis.text.x = element_text(color = "black", size = 12),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(color = "grey96"),
+    legend.position = "top",
+    legend.title = element_text(face = "bold", size = 11)
+  ) +
+  labs(
+    x = "Parasites",
+    y = expression(bold("Tjur "*italic(R)^2))
+  )
+
+# save_fig(g, "../results/tjur.pdf", width = 8, height = 6)
+g
+
+```
+
+## Convergence diagnostics
+```{r}
+# ESS 
+ess_vals <- result_hmsc$ESS
+summary(ess_vals)
+
+ess_all <- unlist(ess_vals)
+
+hist(ess_all, breaks = 50,
+     main = "Effective Sample Size (ESS)",
+     xlab = "ESS")
+
+# Gelman-Rubin PSRF plots
+# PSRF value should be 1-1.05
+gelman <- result_hmsc$gelman
+
+# If diagnostics exist
+if (!inherits(gelman, "try-error")) {
+  
+  # Extract PSRF values
+  psrf_beta <- gelman$Beta$psrf
+  psrf_gamma <- gelman$Gamma$psrf
+  psrf_V <- gelman$V$psrf  
+  
+  
+  extract_psrf <- function(gelman_block) {
+    if (!is.null(gelman_block$psrf)) {
+      data.frame(
+        parameter = rownames(gelman_block$psrf),
+        point_est = gelman_block$psrf[, "Point est."],
+        upper_ci  = gelman_block$psrf[, "Upper C.I."],
+        block = deparse(substitute(gelman_block))
+      )
+    } else {
+      NULL
+    }
+  }
+  
+  psrf_list <- list(
+    Beta  = extract_psrf(gelman$Beta),
+    Gamma = extract_psrf(gelman$Gamma),
+    V     = extract_psrf(gelman$V)
+  )
+  
+  psrf_df <- do.call(rbind, psrf_list)
+  
+} else {
+  cat("Gelman-Rubin diagnostics unavailable.\n")
+}
+
+# Shows the distribution of convergence quality: If most values cluster near 1.0 -> excellent convergence
+ggplot(psrf_df, aes(x = point_est)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 1.1, color = "red", linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Gelman-Rubin PSRF across parameters",
+       x = "PSRF",
+       y = "Count")
+
+# Plot problematic parameters (PSRF > 1.1)
+# Which specific parameters failed to converge
+poor <- subset(psrf_df, point_est > 1.1)
+
+ggplot(poor, aes(x = reorder(parameter, point_est), y = point_est)) +
+  geom_col(fill = "red") +
+  coord_flip() +
+  theme_bw() +
+  labs(title = "Parameters with PSRF > 1.1")
+
+mpost = convertToCodaObject(result_hmsc$model)
+bad_params <- which(psrf_beta[,1] > 1.1)
+
+# Only plot the trouble-makers
+if(length(bad_params) > 0){
+  par(mar = c(2, 2, 2, 2))
+  plot(mpost$Beta[, bad_params, drop = FALSE])
+} else {
+  message("Success: All parameters converged (PSRf < 1.1)!")
+}
+
+mean(psrf_df$point_est)
+sd(psrf_df$point_est)
+```
+
+# Results
+
+## Beta covariates
+```{r}
+# Extract and plot species-level regression coefficients (Beta)
+
+# take predictor names directly from the fitted model's design matrix,
+# so the Beta rows are labelled in the exact order they were estimated.
+predictor_names <- colnames(result_hmsc$model$X)
+
+# Extract Beta mean and support
+beta_mean <- result_hmsc$Beta$mean
+beta_support <- result_hmsc$Beta$support
+
+# Sanity check: row count must match the number of design-matrix columns
+stopifnot(nrow(beta_mean) == length(predictor_names),
+          nrow(beta_support) == length(predictor_names))
+
+# Assign predictor names INCLUDING intercept
+rownames(beta_mean)    <- predictor_names
+rownames(beta_support) <- predictor_names
+
+# REMOVE intercept (first row)
+beta_mean    <- beta_mean[-1, ]
+beta_support <- beta_support[-1, ]
+
+# Long format
+beta_long  <- melt(beta_mean, varnames = c("predictor","final_id"), value.name = "effect")
+support_long <- melt(beta_support, varnames = c("predictor","final_id"), value.name = "support")
+
+# Merge
+beta_long$support <- support_long$support
+
+# Mask to zero unless the effect's sign is well supported:
+#   support >= post_top (0.9)    -> keep positive effect
+#   support <= post_bottom (0.1) -> keep negative effect
+#   otherwise                    -> 0
+beta_long$effect_masked <- ifelse(
+  beta_long$support >= post_top & beta_long$effect > 0, beta_long$effect,
+  ifelse(
+    beta_long$support <= post_bottom & beta_long$effect < 0, beta_long$effect,
+    0
+  )
+)
+
+# signed square-root transformation for visualization
+#beta_long$effect_masked <- sign(beta_long$effect_masked) * sqrt(abs(beta_long$effect_masked))
+
+# saving host specice effect size
+parasite_metadata <- parasite_metadata %>%
+  left_join(beta_long %>% filter(predictor=="host_speciesRattus rattus") %>% select(final_id,effect), by="final_id") %>%
+  mutate(effect_sqrt = sign(effect) * sqrt(abs(effect))) %>%
+  mutate(affinity = abs(effect_sqrt))
+
+
+# --------------------------------------------------------------------
+# Plot
+
+# updating predictor names
+renaming_map <- c(
+  "Land Use" = "dist_village",
+  "Season 2" = "season2",
+  "Season 3" = "season3",
+  "Sex: male" = "sex1",
+  "Body Size" = "size_z",
+  "Host Species: Rattus" = "host_speciesRattus rattus",
+  "Host × Land Use" = "host_speciesRattus rattus:dist_village",
+  "Microbiome Shannon" = "shannon_scaled",
+  "Microbiome Uniqueness" = "uniqueness_scaled",
+  "Microbiome FB" = "FB_z"
+)
+
+# Define the Final Desired Order 
+final_order <- c("Host Species: Rattus","Host × Land Use",
+                 "Land Use", "Season 2", "Season 3",
+                 "Sex: male", "Body Size", "BCI",
+                 "Microbiome Shannon", "Microbiome Uniqueness", "Microbiome FB"
+)
+
+host_order <- c("Rattus rattus", "Microgale brevicaudata") 
+
+# organizing the data
+beta_long_plot <- beta_long %>%
+  left_join(parasite_metadata %>% 
+              select(final_id), by = "final_id") %>%
+  group_by(final_id) %>%
+  mutate(
+    host_rattus_effect = effect[predictor == "host_speciesRattus rattus"][1]
+  ) %>%
+  ungroup() %>%
+  arrange(host_rattus_effect) %>% 
+  mutate(final_id = factor(final_id, levels = unique(final_id))) %>% 
+  mutate(
+    predictor_renamed = fct_recode(predictor, !!!renaming_map)) %>%
+  mutate(predictor_plot = fct_relevel(predictor_renamed, final_order))
+
+
+# parasite table for plotting
+lab_df <- parasite_metadata %>%
+  distinct(final_id, type)
+
+parasite_labels <- setNames(
+  paste0(
+    "<span style='color:", tax_colors[lab_df$type], "'>",
+    lab_df$final_id,
+    "</span>"
+  ),
+  lab_df$final_id
+)
+
+# plot
+max_pos <- max(beta_long_plot$effect_masked, na.rm = TRUE)
+min_neg <- min(beta_long_plot$effect_masked, na.rm = TRUE)
+
+g <- beta_long_plot %>% 
+  ggplot(aes(x = predictor_plot, y = final_id, fill = effect_masked)) +
+  geom_tile(color = "grey60") +
+  scale_fill_gradientn(
+    colors = c("#6247aa", "white", "#d00000"),
+    values = rescale(c(min_neg, 0, max_pos)),
+    limits = c(min_neg, max_pos),
+    na.value = "grey90",
+    name = "Posterior Mean\nCoefficient"
+  ) +
+  scale_y_discrete(labels = parasite_labels)+
+  coord_fixed() +
+  theme_bw() +
+  theme(
+    axis.text.y = element_markdown(),
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),
+    axis.title = element_text(face = "bold", size = 13),
+    legend.title = element_text(face = "bold", size = 10),
+    panel.grid = element_blank(),
+    aspect.ratio = 1
+  ) +
+  labs(
+    x = "Predictors",
+    y = "Parasites"
+  )
+
+#pdf('../results/betas.pdf')
+g
+#dev.off()
+
+
+# --------------------------------------------------------------------
+# number of times each predictor is significant
+
+# Create a list of all possible directions (necessary for complete())
+all_directions <- c("positive", "negative")
+
+# Calculate counts and then complete the data frame
+effect_counts_complete <- beta_long_plot %>%
+  filter(effect_masked != 0) %>%
+  mutate(direction = ifelse(effect_masked > 0, "positive", "negative")) %>%
+  group_by(predictor_plot, direction) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  complete(
+    predictor_plot, 
+    direction = all_directions, 
+    fill = list(n = 0)
+  )
+
+
+# plotting
+
+g2 <- ggplot(effect_counts_complete, aes(x = predictor_plot, y = n, fill = direction)) +
+  geom_col(alpha=0.8) +
+  scale_fill_manual(
+    values = c("positive" = "#d00000", "negative" = "#6247aa")
+  ) +
+  scale_y_continuous(
+  breaks = scales::breaks_width(3),
+  limits = c(0, 9),
+  expand = expansion(mult = c(0, 0.05))
+) +
+  theme_bw() +
+  labs(
+    x = "",
+    y = "Counts"
+  ) +
+  theme(
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position = "none",          
+    panel.grid = element_blank(),
+    plot.margin = margin(1, 1, 1, 1),
+    aspect.ratio = 0.2
+  )
+
+#pdf('../results/betas_total.pdf')
+g2
+#dev.off()
+
+
+beta_combined <- ggarrange(g2, g, ncol = 1, heights = c(1, 6))
+
+# save_fig(beta_combined, "../results/betas_combined.pdf", width = 6, height = 7)
+beta_combined
+```
+
+## Parasite trait effects (Gamma)
+Does parasite type (Protozoa vs Nematode) structure how parasites respond to the
+predictors? Gamma models the effect of the trait on the species-level responses
+(Beta). With `TrFormula = ~ type` there are two trait columns: the intercept
+(baseline = reference level Protozoa) and the "Nematode vs Protozoa" contrast,
+which is the biologically relevant one.
+
+```{r}
+# guard: only run if the loaded model actually has a parasite trait
+trait_ok <- !is.null(result_hmsc$model$Tr) && ncol(result_hmsc$model$Tr) > 1
+if (!trait_ok) {
+  cat("This model has no parasite trait. Refit with Tr = data_trait, TrFormula = ~ type.\n")
+} else {
+  predictor_names <- colnames(result_hmsc$model$X)
+  trait_names     <- colnames(result_hmsc$model$Tr)
+  type_col        <- setdiff(trait_names, "(Intercept)")[1]   # e.g. "typeNematode"
+  # --- posterior draws of Gamma -> credible intervals for the type contrast ---
+  post_g    <- Hmsc::poolMcmcChains(result_hmsc$model$postList)
+  gamma_arr <- simplify2array(lapply(post_g, function(p) p$Gamma))   # predictors x traits x draws
+  dimnames(gamma_arr) <- list(predictor_names, trait_names, NULL)
+  gamma_type <- gamma_arr[, type_col, ]                              # predictors x draws
+  gamma_tab <- data.frame(
+    predictor = rownames(gamma_type),
+    mean      = rowMeans(gamma_type),
+    lo        = apply(gamma_type, 1, quantile, 0.1),
+    hi        = apply(gamma_type, 1, quantile, 0.9),
+    support   = rowMeans(gamma_type > 0),                            # posterior P(Gamma > 0)
+    row.names = NULL
+  ) %>%
+    filter(predictor != "(Intercept)") %>%
+    mutate(
+      supported = support >= post_top | support <= post_bottom,
+      fill_cat  = case_when(supported & mean > 0 ~ "positive",
+                            supported & mean < 0 ~ "negative",
+                            TRUE ~ "ns"),
+      predictor_renamed = fct_recode(factor(predictor), !!!renaming_map),
+      predictor_plot    = fct_relevel(predictor_renamed, final_order),
+      predictor_plot    = fct_rev(predictor_plot)   # top-down order in the forest plot
+    )
+
+  # --- Overall (average across predictors), computed per draw for a proper CrI ---
+  gt_noint      <- gamma_type[rownames(gamma_type) != "(Intercept)", , drop = FALSE]
+  overall_draws <- colMeans(gt_noint)               # mean across predictors, one value per draw
+  overall_row <- data.frame(
+    predictor = "Overall",
+    mean      = mean(overall_draws),
+    lo        = quantile(overall_draws, 0.1),
+    hi        = quantile(overall_draws, 0.9),
+    support   = mean(overall_draws > 0),
+    row.names = NULL
+  ) %>%
+    mutate(
+      supported = support >= post_top | support <= post_bottom,
+      fill_cat  = case_when(supported & mean > 0 ~ "positive",
+                            supported & mean < 0 ~ "negative",
+                            TRUE ~ "ns")
+    )
+
+  # --- build ONE frame; give BOTH parts predictor_plot (as character) before binding ---
+  pred_levels <- setdiff(as.character(levels(gamma_tab$predictor_plot)), "Overall")
+  all_levels  <- c("Overall", pred_levels)          # level 1 = BOTTOM of the y-axis
+
+  gamma_all <- bind_rows(
+    transmute(gamma_tab,   predictor, mean, lo, hi, support, supported, fill_cat,
+              predictor_plot = as.character(predictor_plot), is_overall = FALSE),
+    transmute(overall_row, predictor, mean, lo, hi, support, supported, fill_cat,
+              predictor_plot = "Overall",                     is_overall = TRUE)
+  )
+  gamma_all$predictor_plot <- factor(gamma_all$predictor_plot, levels = all_levels)
+
+  # sanity check: no NA, Overall is level 1
+  stopifnot(!anyNA(gamma_all$predictor_plot))
+  cat("y-levels (bottom -> top):", paste(levels(gamma_all$predictor_plot), collapse = " | "), "\n")
+
+  gamma_pred <- gamma_all[!gamma_all$is_overall, ]
+  gamma_ovl  <- gamma_all[ gamma_all$is_overall, ]
+
+  cat("Gamma: Nematode vs Protozoa contrast (posterior mean, 90% CrI, P[Gamma>0]):\n")
+  print(gamma_pred %>% select(predictor, mean, lo, hi, support, supported))
+  cat("Overall (average across predictors):\n")
+  print(gamma_ovl %>% select(predictor, mean, lo, hi, support, supported))
+
+  # --- forest plot of the type contrast ---
+  sign_colors <- c(positive = "#023e8a", negative = "#7f5539", ns = "grey50")   # borders
+  fill_colors <- c(positive = "#023e8a", negative = "#7f5539", ns = "white")    # interiors (ns = hollow)
+
+  g_gamma <- ggplot(gamma_all, aes(x = mean, y = predictor_plot)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+    geom_hline(yintercept = 1.5, linetype = "dotted", color = "grey50") +   # separator just above Overall
+    geom_errorbarh(aes(xmin = lo, xmax = hi, color = fill_cat), height = 0.22, linewidth = 0.7) +
+    geom_point(data = gamma_pred, aes(color = fill_cat, fill = fill_cat),
+               shape = 21, size = 3.6, stroke = 0.9) +
+    geom_point(data = gamma_ovl,  aes(color = fill_cat, fill = fill_cat),
+               shape = 23, size = 5, stroke = 0.9) +
+    scale_color_manual(values = sign_colors, guide = "none") +
+    scale_fill_manual(values = fill_colors, guide = "none") +
+    labs(
+      x = expression(bold("Trait Effect on Response")),
+      y = "Predictors"
+    ) +
+    theme_bw() +
+    theme(
+      axis.text.y = element_text(color = "black", size = 11),
+      axis.text.x = element_text(color = "black", size = 11),
+      axis.title  = element_text(face = "bold", size = 13),
+      panel.grid.minor   = element_blank(),
+      panel.grid.major.y = element_blank(),
+      aspect.ratio = 1
+    )
+  #pdf('../results/gamma_type.pdf')
+  print(g_gamma)
+  #dev.off()
+}
+```
+
+### Variance in responses explained by the trait
+```{r}
+# R2T: how much of the between-parasite variation in responses is explained by
+# the trait. R2T$Y = fraction of variation in Y (via fixed effects) explained by
+# traits; R2T$Beta = the same, per predictor.
+if (trait_ok) {
+  vp <- result_hmsc$variance_partitioning
+  if (!is.null(vp$R2T$Y)) {
+    cat("Proportion of variance in Y explained by the trait (mean R2T$Y):",
+        round(mean(vp$R2T$Y, na.rm = TRUE), 3), "\n\n")
+  }
+  r2t_beta <- data.frame(
+    predictor = names(vp$R2T$Beta),
+    r2t       = as.numeric(vp$R2T$Beta),
+    row.names = NULL
+  )
+  if (all(is.na(r2t_beta$predictor)) || is.null(r2t_beta$predictor)) {
+    r2t_beta$predictor <- colnames(result_hmsc$model$X)
+  }
+  r2t_beta <- r2t_beta %>%
+    filter(predictor != "(Intercept)") %>%
+    mutate(
+      predictor_renamed = fct_recode(factor(predictor), !!!renaming_map),
+      predictor_plot    = fct_relevel(predictor_renamed, final_order),
+      predictor_plot    = fct_rev(predictor_plot)
+    )
+
+  # --- Overall: total variance in Y explained by the trait (R2T$Y), not a mean of the bars ---
+  overall_r2t <- mean(vp$R2T$Y, na.rm = TRUE)
+  r2t_overall <- data.frame(predictor = "Overall", r2t = overall_r2t, row.names = NULL)
+
+  # "Overall" = first level = BOTTOM row; predictors above it
+  all_levels <- c("Overall", levels(r2t_beta$predictor_plot))
+  r2t_beta    <- r2t_beta    %>% mutate(predictor_plot = factor(as.character(predictor_plot), levels = all_levels))
+  r2t_overall <- r2t_overall %>% mutate(predictor_plot = factor("Overall", levels = all_levels))
+  r2t_plot <- bind_rows(r2t_beta, r2t_overall)
+
+  cat("R2T per predictor (variance in response explained by trait):\n")
+  print(r2t_beta %>% select(predictor, r2t))
+  cat("Overall (total variance in Y explained by trait, R2T$Y):", round(overall_r2t, 3), "\n")
+
+  g_r2t <- ggplot(r2t_plot, aes(x = r2t, y = predictor_plot)) +
+    geom_hline(yintercept = 1.5, linetype = "dotted", color = "grey50") +   # separator above Overall
+    geom_col(fill = "#4895EF", width = 0.7) +                               # single fill for all bars
+    scale_x_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.05))) +
+    labs(
+      x = "Variance Explained by Trait",
+      y = "Predictors"
+    ) +
+    theme_bw() +
+    theme(
+      axis.text.y = element_text(color = "black", size = 11),
+      axis.text.x = element_text(color = "black", size = 11),
+      axis.title  = element_text(face = "bold", size = 13),
+      panel.grid.minor   = element_blank(),
+      panel.grid.major.y = element_blank(),
+      aspect.ratio = 1
+    )
+  #pdf('../results/gamma_r2t.pdf')
+  print(g_r2t)
+  #dev.off()
+}
+```
+
+```{r}
+if (trait_ok) {
+  g_gamma_noy <- g_gamma +
+    theme(axis.title.y = element_blank(),
+          axis.text.y  = element_blank(),
+          axis.ticks.y = element_blank()) 
+
+  g_r2t_2l <- g_r2t
+
+  gamma_combined <- (g_r2t_2l + g_gamma_noy) +
+    plot_layout(axes = "collect") +
+    plot_annotation(tag_levels = "A") &
+    theme(plot.tag = element_text(face = "bold", size = 14))
+
+  # save_fig(gamma_combined, "../results/parasite_trait.pdf", width = 8, height = 4)
+
+  print(gamma_combined)
+
+}
+```
+
+## Host X land-use interaction
+
+```{r}
+# --------------------------------------------------------------------
+# Host x land-use interaction: tests + three figures
+#   fig_prob_facet: predicted occurrence per host, filtered to that host's parasites (MAIN)
+#   fig_richness  : predicted richness per host along the gradient                  (CLOSER)
+#   fig_forest    : per-parasite interaction coefficient + community mean           (SUPPLEMENT)
+# --------------------------------------------------------------------
+
+## --- SETTINGS ---
+focal_var      <- "dist_village"
+ngrid          <- 50
+prev_threshold <- 5
+host_levels    <- c("Microgale brevicaudata", "Rattus rattus")
+host_colors    <- c("Rattus rattus" = "#fb8500", "Microgale brevicaudata" = "#0a9396")
+dist_unit <- "km"
+
+dist_mean <- mean(data_x$dist_village)
+dist_sd   <- sd(data_x$dist_village)
+to_real   <- function(z) z * dist_sd + dist_mean
+x_lab     <- "Land Use Gradient [Distance to Village in km]"
+
+
+## --- SHARED SETUP ---
+hM   <- result_hmsc$model
+post <- Hmsc::poolMcmcChains(hM$postList)
+ns   <- ncol(hM$Y)
+
+row_main <- which(colnames(hM$X) == focal_var)
+int_col  <- grep(":", colnames(hM$X), value = TRUE); int_col <- int_col[grepl(focal_var, int_col)]
+stopifnot(length(row_main) == 1, length(int_col) == 1)
+row_int  <- which(colnames(hM$X) == int_col)
+
+bm <- vapply(post, function(p) p$Beta[row_main, ], numeric(ns))
+bi <- vapply(post, function(p) p$Beta[row_int,  ], numeric(ns))
+rownames(bm) <- rownames(bi) <- colnames(hM$Y)
+
+host_vec <- hM$XData$host_species
+prev <- sapply(host_levels, function(h) colSums(hM$Y[host_vec == h, , drop = FALSE], na.rm = TRUE))
+rownames(prev) <- colnames(hM$Y)
+
+## --- TESTS ---
+pooled_int <- colMeans(bi)
+cat("=== PRIMARY TEST: community-mean host x", focal_var, "interaction ===\n")
+cat(sprintf("  beta = %.3f   95%% CrI [%.3f, %.3f]   90%% CrI [%.3f, %.3f]   P(>0) = %.2f\n\n",
+            mean(pooled_int),
+            quantile(pooled_int, 0.025), quantile(pooled_int, 0.975),
+            quantile(pooled_int, post_bottom), quantile(pooled_int, post_top),
+            mean(pooled_int > 0)))
+
+# robust reference detection: interaction column name contains the NON-reference host
+nonref_host <- host_levels[vapply(host_levels, function(h) grepl(h, int_col, fixed = TRUE), logical(1))]
+ref_host    <- setdiff(host_levels, nonref_host)
+stopifnot(length(ref_host) == 1, length(nonref_host) == 1)
+cat(sprintf("Reference host (= dist_village main effect): %s\n", ref_host))
+
+slope_by_host <- setNames(list(bm, bm + bi), c(ref_host, nonref_host))   # correctly keyed
+slope_ref    <- colMeans(slope_by_host[[ref_host]])
+slope_nonref <- colMeans(slope_by_host[[nonref_host]])
+cat(sprintf("%-24s community slope: %.3f  90%% CrI [%.3f, %.3f]  P(>0)=%.2f\n",
+            ref_host, mean(slope_ref), quantile(slope_ref,.1), quantile(slope_ref,.9), mean(slope_ref>0)))
+cat(sprintf("%-24s community slope: %.3f  90%% CrI [%.3f, %.3f]  P(>0)=%.2f\n",
+            nonref_host, mean(slope_nonref), quantile(slope_nonref,.1), quantile(slope_nonref,.9), mean(slope_nonref>0)))
+
+# per-parasite interaction; 90% CrI (post_bottom-post_top) matches the support
+# threshold used to flag support in the forest plot (so bars exclude 0 iff supported)
+int_tab <- data.frame(final_id = colnames(hM$Y), mean = rowMeans(bi),
+                      lo = apply(bi, 1, quantile, post_bottom), hi = apply(bi, 1, quantile, post_top),
+                      pgt0 = rowMeans(bi > 0), row.names = NULL) %>%
+  left_join(parasite_metadata %>% distinct(final_id, type, effect), by = "final_id") %>%
+  arrange(effect)
+cat("=== Per-parasite interaction (90% CrI) [descriptive] ===\n"); print(int_tab, digits = 3)
+
+## --- predict once per host: richness + per-parasite prob curves ---
+predict_gradient <- function(hM, focal, host_level, ngrid = 50) {
+  gr <- constructGradient(hM, focalVariable = focal,
+                          non.focalVariables = list(host_species = list(3, host_level)), ngrid = ngrid)
+  pr <- predict(hM, Gradient = gr, expected = TRUE, predictEtaMean = TRUE)
+  if (!is.list(pr)) pr <- lapply(seq_len(dim(pr)[3]), function(i) pr[, , i])
+  list(x = gr$XDataNew[[focal]], pred = pr)
+}
+rich_mat <- list(); pp_mean <- list(); x_gridR <- NULL
+for (h in host_levels) {
+  g <- predict_gradient(hM, focal_var, h, ngrid)
+  rich_mat[[h]] <- sapply(g$pred, rowSums)
+  M <- Reduce(`+`, g$pred) / length(g$pred); colnames(M) <- colnames(hM$Y)
+  pp_mean[[h]] <- M
+  x_gridR <- g$x
+}
+
+## --- FIG 1 (MAIN): per-host occurrence, filtered ---
+prob_long <- bind_rows(lapply(host_levels, function(h) {
+  M    <- pp_mean[[h]]
+  keep <- colnames(M)[prev[colnames(M), h] >= prev_threshold]
+  as.data.frame(M[, keep, drop = FALSE]) %>%
+    mutate(x_real = to_real(x_gridR)) %>%
+    pivot_longer(-x_real, names_to = "final_id", values_to = "prob") %>%
+    mutate(host = h)
+})) %>%
+  left_join(parasite_metadata %>% distinct(final_id, type, effect), by = "final_id") %>%
+  mutate(host = factor(host, levels = host_levels), final_id = fct_reorder(final_id, effect))
+
+## --- community (average) curve per host ---
+# mean predicted occurrence across the parasites shown in each facet
+community_mean <- prob_long %>%
+  group_by(host, x_real) %>%
+  summarise(prob = mean(prob), .groups = "drop")
+
+fig_prob_facet <- ggplot(prob_long, aes(x_real, prob, group = final_id, color = effect)) +
+  geom_line(linewidth = 0.9) +
+  # community mean (average across shown parasites), drawn on top
+  geom_line(data = community_mean, aes(x_real, prob),
+            inherit.aes = FALSE, color = "white", linewidth = 2.1) +
+  geom_line(data = community_mean, aes(x_real, prob, linetype = "Community Mean"),
+            inherit.aes = FALSE, color = "black", linewidth = 1.3) +
+  scale_linetype_manual(values = c("Community Mean" = "solid"), name = NULL) +
+  facet_wrap(~ host) +
+  scale_color_gradient2(low = "#0a9396", mid = "grey90", high = "#fb8500",
+                        midpoint = 0, name = "Host Association") +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0.02, 0.05))) +
+  guides(color = guide_colorbar(barheight = unit(4.5, "cm"))) +
+  labs(x = x_lab, y = "Predicted Occurrence Probability") +
+  theme_bw(base_size = 14) +
+  theme(aspect.ratio = 1, panel.grid = element_blank(),
+        strip.background = element_rect(fill = "grey90", color = "black"),
+        strip.text = element_text(face = "bold.italic", size = 12),
+        panel.border     = element_rect(color = "black", fill = NA, linewidth = 0.7),
+        axis.title = element_text(face = "bold", size = 14),
+        axis.text = element_text(color = "black", size = 12),
+        legend.title = element_text(face = "bold", size = 12), legend.text = element_text(size = 11))
+
+# save_fig(fig_prob_facet, "../results/prob_dist_village.pdf", width = 8, height = 5)
+
+fig_prob_facet
+
+# --------------------------------------------------------------------
+# FIG: per-host LATENT land-use response, faceted by host,
+#      filtered to parasites with >= prev_threshold occurrences in that host.
+# reuses bm, bi, prev, dist_mean/sd, host_levels from the shared setup.
+# --------------------------------------------------------------------
+center_latent <- TRUE     # TRUE: each line centred on its own mean (shows slope only)
+                          # FALSE: keep latent intercept (shows level + slope)
+
+xseqL <- seq(min(hM$XData[[focal_var]]), max(hM$XData[[focal_var]]), length.out = ngrid)
+xcL   <- if (center_latent) xseqL - mean(xseqL) else xseqL
+
+
+
+lat_long <- bind_rows(lapply(host_levels, function(h) {
+  sl   <- slope_by_host[[h]]                                  # ns x ndraws
+  keep <- rownames(sl)[prev[rownames(sl), h] >= prev_threshold]
+  bind_rows(lapply(keep, function(sp) {
+    M <- outer(xcL, sl[sp, ])                                 # ngrid x ndraws latent response
+    data.frame(final_id = sp, host = h, x_real = to_real(xseqL),
+               mean = rowMeans(M),
+               lo = apply(M, 1, quantile, 0.025), hi = apply(M, 1, quantile, 0.975))
+  }))
+})) %>%
+  left_join(parasite_metadata %>% distinct(final_id, type, effect), by = "final_id") %>%
+  mutate(host = factor(host, levels = host_levels), final_id = fct_reorder(final_id, effect))
+
+fig_latent_filt <- ggplot(lat_long, aes(x_real, mean, group = final_id, color = effect)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ host) +
+  scale_color_gradient2(low = "#0a9396", mid = "grey90", high = "#fb8500",
+                        midpoint = 0, name = "Host Association") +
+  guides(color = guide_colorbar(barheight = unit(4.5, "cm"))) +
+  labs(x = x_lab,
+       y = "Land Use Response") +
+  theme_bw(base_size = 14) +
+  theme(aspect.ratio = 1, panel.grid = element_blank(),
+        strip.background = element_rect(fill = "grey90", color = "black"),
+        strip.text = element_text(face = "bold.italic", size = 12),
+        panel.border     = element_rect(color = "black", fill = NA, linewidth = 0.7),
+        axis.title = element_text(face = "bold", size = 14),
+        axis.text = element_text(color = "black", size = 12),
+        legend.title = element_text(face = "bold", size = 12), legend.text = element_text(size = 11))
+
+# save_fig(fig_latent_filt, "../results/prob_dist_village_latent.pdf", width = 8, height = 5)
+fig_latent_filt
+
+## --- FIG 2: predicted richness per host ---
+richA <- bind_rows(lapply(host_levels, function(h) {
+  rm <- rich_mat[[h]]
+  data.frame(x_real = to_real(x_gridR), mean = rowMeans(rm),
+             lo = apply(rm, 1, quantile, 0.025), hi = apply(rm, 1, quantile, 0.975), host = h)
+})) %>% mutate(host = factor(host, levels = host_levels))
+
+i_lo <- which.min(x_gridR); i_hi <- which.max(x_gridR)
+chg  <- lapply(host_levels, function(h) rich_mat[[h]][i_hi, ] - rich_mat[[h]][i_lo, ]); names(chg) <- host_levels
+did  <- chg[["Rattus rattus"]] - chg[["Microgale brevicaudata"]]
+qsum <- function(v) sprintf("%.2f  95%% CrI [%.2f, %.2f]  P(>0)=%.2f",
+                            mean(v), quantile(v, 0.025), quantile(v, 0.975), mean(v > 0))
+cat(sprintf("\n=== Richness change across gradient (%.1f -> %.1f %s) [same effect, richness scale] ===\n",
+            to_real(x_gridR[i_lo]), to_real(x_gridR[i_hi]), dist_unit))
+for (h in host_levels) cat("  ", h, ":", qsum(chg[[h]]), "\n")
+cat("=== Richness difference-in-differences ===\n  ", qsum(did), "\n")
+
+fig_richness <- ggplot(richA, aes(x_real, mean, color = host, fill = host)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.18, color = NA) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(values = host_colors, name = "Host Species") +
+  scale_fill_manual(values  = host_colors, name = "Host Species") +
+  labs(x = x_lab, y = "Predicted Parasite Richness") +
+  theme_bw(base_size = 14) +
+  theme(aspect.ratio = 0.62, panel.grid = element_blank(),
+        panel.border     = element_rect(color = "black", fill = NA, linewidth = 0.7),
+        axis.title = element_text(face = "bold", size = 14),
+        axis.text = element_text(color = "black", size = 12),
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 11, face = "italic"))
+
+# save_fig(fig_richness, "../results/pred_richness.pdf", width = 8, height = 5)
+fig_richness
+
+## --- FIG 3 (SUPPLEMENT): interaction forest plot ---
+fp <- int_tab %>%
+  transmute(label = as.character(final_id), mean, lo, hi, effect, pgt0, type,
+            is_comm = FALSE,
+            sig = pgt0 >= post_top | pgt0 <= post_bottom)
+fp <- bind_rows(fp, data.frame(label = "Community Mean", mean = mean(pooled_int),
+                               lo = quantile(pooled_int, 0.1), hi = quantile(pooled_int, 0.9),
+                               effect = NA, pgt0 = mean(pooled_int > 0), type = NA,
+                               is_comm = TRUE, sig = TRUE, row.names = NULL))
+fp$label <- factor(fp$label, levels = c("Community Mean", int_tab$final_id))
+
+# build parasite colors in their existing (correct) order, community appended to match its top position
+lev <- levels(fp$label)
+type_by_lev <- parasite_metadata$type[match(lev, parasite_metadata$final_id)]
+lab_cols <- ifelse(lev == "Community mean", "black",
+                   tax_colors[as.character(type_by_lev)])
+lab_cols[is.na(lab_cols)] <- "black"
+# community is level 1 but renders at the TOP -> move its color to the end so the
+# color vector lines up with the drawn (top-to-bottom) tick order
+lab_cols <- c(lab_cols[lev != "Community Mean"], lab_cols[lev == "Community Mean"])
+
+fig_forest <- ggplot(fp, aes(mean, label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  # parasites: filled if significant, hollow if not
+  geom_errorbarh(data = subset(fp, !is_comm),
+                 aes(xmin = lo, xmax = hi, color = effect), height = 0.25, linewidth = 0.7) +
+  geom_point(data = subset(fp, !is_comm & sig),  aes(color = effect), size = 3.5) +
+  geom_point(data = subset(fp, !is_comm & !sig), aes(color = effect), size = 3.5,
+             shape = 21, fill = "white", stroke = 1) +
+  # community mean: black diamond
+  geom_errorbarh(data = subset(fp, is_comm),
+                 aes(xmin = lo, xmax = hi), height = 0.32, linewidth = 1, color = "black") +
+  geom_point(data = subset(fp, is_comm), shape = 18, size = 5.5, color = "black") +
+  scale_color_gradient2(low = "#0a9396", mid = "grey90", high = "#fb8500",
+                        midpoint = 0, name = "Host Association") +
+  guides(color = guide_colorbar(barheight = unit(4.5, "cm"))) +
+  labs(x = expression(bold("Host \u00d7 Land Use Interaction ("*beta*")")), y = NULL) +
+  theme_bw(base_size = 14) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.y = element_blank(),
+        panel.border     = element_rect(color = "black", fill = NA, linewidth = 0.7),
+        axis.text.y = element_text(size = 11, color = lab_cols),
+        axis.text.x = element_text(color = "black", size = 12),
+        axis.title  = element_text(face = "bold", size = 14),
+        legend.title = element_text(face = "bold", size = 11), legend.text = element_text(size = 10))
+
+# save_fig(fig_forest, "../results/interaction_forest.pdf", width = 8, height = 5)
+fig_forest
+
+```
+
+## Predictability
+
+```{r}
+# --------------------------------------------------------------------
+# Predictability (CV Tjur's R^2): what is it associated with?
+# Descriptive only — 11 parasites, so no model selection.
+# --------------------------------------------------------------------
+
+# number of infected hosts per parasite
+n_hosts <- data.frame(n = colSums(data_parasites_mat)) %>% rownames_to_column("final_id")
+r2_data <- n_hosts %>%
+  left_join(parasite_metadata, by = "final_id") %>%
+  mutate(log_n = log(n), affinity = abs(effect))   # affinity = strength of host association
+
+## --- bivariate associations with predictability (Spearman) ---
+pred_vars <- c(log_n = "log_n", host_association = "effect", affinity = "affinity")
+cor_tab <- bind_rows(lapply(names(pred_vars), function(v) {
+  ct <- suppressWarnings(cor.test(r2_data[[pred_vars[v]]], r2_data$tjur_cv, method = "spearman"))
+  data.frame(predictor = v, rho = unname(ct$estimate), p = ct$p.value)
+}))
+cat("=== Spearman correlations with CV Tjur's R^2 (n = 11, descriptive) ===\n")
+print(cor_tab, digits = 2)
+
+## --- collinearity among predictors (why we can't separate them) ---
+cat("\n=== Correlations among predictors (Spearman) ===\n")
+print(round(cor(r2_data[, c("log_n", "effect", "affinity")],
+                method = "spearman", use = "pairwise"), 2))
+
+## --- difference by parasite type ---
+wt <- suppressWarnings(wilcox.test(tjur_cv ~ type, data = r2_data))
+cat(sprintf("\n=== CV Tjur's R^2 by type (Wilcoxon): W = %.0f, p = %.3f ===\n",
+            wt$statistic, wt$p.value))
+r2_data %>% group_by(type) %>%
+  summarise(median_R2 = median(tjur_cv), mean_R2 = mean(tjur_cv), n = n(), .groups = "drop") %>%
+  print()
+
+## --- figure: predictability vs host association, sized by prevalence, loess trend ---
+g <- ggplot(r2_data, aes(x = effect, y = tjur_cv)) +
+  geom_smooth(method = "loess", se = FALSE, span = 1, color = "grey40", linewidth = 0.9) +
+  geom_point(aes(color = type, size = n), alpha = 1, stroke = 0.8) +
+  scale_color_manual(values = tax_colors, name = "Taxonomic Group") +
+  scale_size_continuous(name = "Number of\nInfected Hosts",
+                        breaks = scales::pretty_breaks(n = 6), range = c(2, 8)) +
+  scale_y_continuous(expand = expansion(mult = c(0.03, 0.05))) +
+  coord_cartesian(ylim = c(0, 0.6), clip = "on") +
+  theme_bw() +
+  theme(text = element_text(size = 14),
+        axis.title = element_text(face = "bold", size = 16),
+        axis.text = element_text(color = "black", size = 13),
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 11),
+        panel.grid = element_blank(),
+        aspect.ratio = 1, legend.position = "right") +
+  guides(color = guide_legend(override.aes = list(shape = 16, size = 3.5)),
+         size  = guide_legend(override.aes = list(linetype = 0, shape = 16))) +
+  labs(x = "Host Association",
+       y = expression(bold("Explained Variance (CV Tjur "*italic(R)^2*")")))
+
+# save_fig(g, "../results/predictability.pdf", width = 7, height = 5)
+g
+```
+
+
+## Variance partitioning
+
+```{r}
+# explained variance
+vp <- result_hmsc$variance_partitioning
+
+```
+
+### By parasite
+```{r}
+renaming_map_vp <- c(
+  "host_species"               = "Host Species",
+  "dist_village"               = "Land Use",
+  "host_species:dist_village"  = "Host × Land Use", 
+  "season"                     = "Season",
+  "Random: site"               = "Random: site",
+  "sex"                        = "Sex",
+  "size_z"                     = "Body Size",
+  "BCI"                        = "BCI",
+  "shannon_scaled"             = "Microbiome Shannon",
+  "uniqueness_scaled"          = "Microbiome Uniqueness",
+  "FB_z"                       = "Microbiome FB",
+  "Random: individual"         = "Random: individual"
+)
+# reordered
+component_order_renamed <- c(
+  "Host Species", "Host × Land Use", "Land Use",
+  "Season", "Random: site",
+  "Sex", "Body Size", "BCI",
+  "Microbiome Shannon", "Microbiome Uniqueness", "Microbiome FB",
+  "Random: individual"
+)
+component_colors <- c(
+  "Host Species"          = "#bcbddc",
+  "Host × Land Use"       = "#df7373",   
+  "Land Use"              = "darkgreen",
+  "Season"                = "#A6D96A",
+  "Random: site"          = "#d9ef8b",
+  "Sex"                   = "#ffa200",
+  "Body Size"             = "#ffca3a",
+  "BCI"                   = "#fcf45d",   
+  "Microbiome Shannon"    = "#004e89",
+  "Microbiome Uniqueness" = "#2A6FBB",
+  "Microbiome FB"         = "#81c3d7",
+  "Random: individual"    = "#f2e8cf"
+)
+
+vp_df_plot <- melt(vp$vals, varnames = c("component", "final_id"), value.name = "variance") %>%
+  left_join(parasite_metadata %>% select(final_id, type, effect), by = "final_id") %>%
+  arrange(effect) %>%
+  mutate(final_id = factor(final_id, levels = unique(final_id))) %>%
+  mutate(component_plot = dplyr::recode(component, !!!renaming_map_vp)) %>%
+  mutate(component_plot = factor(component_plot, levels = component_order_renamed))
+
+r2_labels <- vp_df_plot %>%
+  distinct(final_id) %>%
+  left_join(parasite_metadata %>% distinct(final_id, tjur_cv), by = "final_id") %>%
+  mutate(tjur_cv_lab = paste0("R\u00b2 = ", sprintf("%.2f", tjur_cv)))
+
+g <- ggplot(vp_df_plot, aes(x = final_id, y = variance, fill = component_plot)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  coord_flip(clip = "off") +
+  scale_x_discrete(labels = parasite_labels) +
+  scale_fill_manual(values = component_colors, name = "Predictors") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1.001), labels = scales::percent) +
+  theme_bw() +
+  theme(axis.text.y = element_markdown(size = 10, face = "italic"),
+        axis.text.x = element_text(color = "black", size = 10),
+        axis.title = element_text(face = "bold", size = 14),
+        panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+        legend.position = "right", legend.title = element_text(face = "bold", size = 14),
+        legend.text = element_text(size = 10), legend.spacing.y = unit(0.1, "cm"),
+        legend.box.margin = margin(0, 0, 0, 0), aspect.ratio = 1,
+        plot.margin = margin(5.5, 5.5, 5.5, 5.5)) +
+  guides(fill = guide_legend(keywidth = unit(0.6, "cm"), keyheight = unit(0.6, "cm"))) +
+  labs(x = "Parasites", y = "Proportion of Variance Explained")
+
+# save_fig(g, "../results/vp_parasite.pdf", width = 8, height = 6)
+
+g
+
+
+```
+
+
+```{r}
+# Tjur R2 dot plot
+tjur_plot_df <- parasite_metadata %>%
+  distinct(final_id, tjur_cv, tjur_fit) %>%
+  mutate(
+    final_id = factor(final_id, levels = levels(vp_df_plot$final_id)),
+    tjur_cv_lab = sprintf("%.2f", tjur_cv)
+  ) %>%
+  arrange(final_id)
+
+g_tjur <- ggplot(tjur_plot_df, aes(y = final_id)) +
+  # horizontal 0–1 reference line for each parasite
+  geom_segment(
+    aes(x = 0, xend = 0.7, yend = final_id),
+    linewidth = 0.4,
+    color = "black"
+  ) +
+  # point at explanatory (in-sample) Tjur R2 value — drawn first, so it sits under
+  geom_point(
+    aes(x = tjur_fit),
+    size = 4,
+    color = "grey70"
+  ) +
+  # point at cross-validated Tjur R2 value
+  geom_point(
+    aes(x = tjur_cv),
+    size = 4,
+    color = "black"
+  ) +
+  # numeric value to the right
+  geom_text(
+    aes(x = 0.75, label = tjur_cv_lab),
+    hjust = 0,
+    size = 4
+  ) +
+  scale_y_discrete(
+    limits = levels(vp_df_plot$final_id),
+    labels = parasite_labels
+  ) +
+  scale_x_continuous(
+    limits = c(0, 1),
+    breaks = c(0, 0.5, 1),
+    #labels = scales::percent_format(accuracy = 1),
+    expand = c(0, 0)
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_bw() +
+  theme(
+    axis.text.y = element_blank(),      # remove parasite names if aligning next to main plot
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.title = element_text(face = "bold", size = 14),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(5.5, 35, 5.5, 5.5),
+    aspect.ratio = 2.5
+  ) +
+  labs(
+    x = expression(bold("Tjur's "*italic(R)^2*"")),
+    y = NULL
+  )
+
+# save_fig(g_tjur, "../results/vp_parasite_tjur.pdf", width = 2, height = 5)
+
+g_tjur
+
+```
+
+```{r}
+# --------------------------------------------------------------------
+# Combine two figures with panels matched in height
+# --------------------------------------------------------------------
+library(egg)
+library(grid)
+library(gridExtra)
+
+## --- shared panel height ---
+PANEL_H <- unit(8, "cm")
+
+## --- strip aspect.ratio so set_panel_size fully controls the panels ---
+## (do this here in case it's still set inside the plots' own themes)
+fig_square <- g + theme(aspect.ratio = NULL)
+fig_tall   <- g_tjur   + theme(aspect.ratio = NULL)
+
+## --- fix panel dimensions (each plot separately) ---
+p_sq   <- set_panel_size(fig_square, width = unit(8,   "cm"), height = PANEL_H)  # square
+p_tall <- set_panel_size(fig_tall,   width = unit(3.2, "cm"), height = PANEL_H)  # tall & narrow
+
+## --- verify panels are actually the same height (read from the gtables) ---
+panel_h <- function(g) {
+  i <- unique(g$layout$t[grepl("panel", g$layout$name)])
+  g$heights[i]
+}
+cat("square panel height:"); print(panel_h(p_sq))
+cat("tall panel height:  "); print(panel_h(p_tall))
+
+## --- arrange side by side, each column given its OWN full width (panel + axes + labels) ---
+## this prevents the square plot's y-axis title/labels from being clipped
+combined <- arrangeGrob(
+  p_sq, p_tall, nrow = 1,
+  widths = unit.c(sum(p_sq$widths), sum(p_tall$widths))
+)
+
+save_fig(combined, "../results/combined.pdf", width = 10, height = 6)
+```
+
+### By component
+```{r}
+# averaging predictors across all parasites (with parasite weights)
+vp_group <- vp_df_plot %>% 
+  left_join(parasite_metadata, by = "final_id") %>% 
+  mutate(variance_norm = variance*tjur_weight) %>% 
+  group_by(component) %>% 
+  summarise(variance_weight = sum(variance_norm), .groups = "drop") 
+
+# sanity check: summed to 1
+sum(vp_group$variance_weight)
+
+vp_group_plot <- vp_group %>%
+  # Apply the new names
+  mutate(component_plot = dplyr::recode(component, !!!renaming_map_vp)) %>%
+  # Set the factor levels
+  mutate(component_plot = factor(component_plot, levels = component_order_renamed))
+
+# plotting
+g1 <- ggplot(vp_group_plot, aes(x = component_plot, y = variance_weight, fill = component_plot)) +
+  geom_col(color = "white", linewidth = 0.3) +
+  scale_fill_manual(values = component_colors) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 0.5), labels = scales::percent) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "none",
+    axis.title = element_text(face = "bold", size = 12),
+    aspect.ratio = 0.4
+  ) +
+  labs(
+    x = "",
+    y = "Weighted Mean Variance Explained"
+  )
+
+# save_fig(g1, "../results/vp_group1.pdf", width = 8, height = 6)
+
+g1
+```
+
+### By category
+
+```{r}
+# disease pyramid categories
+# explicit component -> category lookup keyed by component name
+category_table <- data.frame(
+  component = c("sex", "size_z", "BCI",
+               "dist_village", "season", "Random: site",
+               "host_species",
+               "host_species:dist_village",
+               "FB_z", "uniqueness_scaled", "shannon_scaled",
+               "Random: individual"),
+  category  = c("Host Attributes", "Host Attributes", "Host Attributes",
+               "Environment", "Environment", "Environment",
+               "Host Species",
+               "Host × Land Use",
+               "Microbiome", "Microbiome", "Microbiome",
+               "Random: individual"),
+  stringsAsFactors = FALSE
+)
+# sanity check: every VP component has a category mapping
+stopifnot(all(rownames(vp$vals) %in% category_table$component))
+
+# order (interaction kept as its own category, after Environment)
+category_order <- c("Host Species",
+                    "Host × Land Use",
+                    "Environment",
+                    "Host Attributes",
+                    "Microbiome",
+                    "Random: individual")
+
+# colors (interaction color matches the per-predictor VP figure)
+vp_colors <- c(
+  "Host Species"       = "#bcbddc",
+  "Host × Land Use"    = "#df7373",
+  "Environment"        = "#98c9a3",
+  "Host Attributes"    = "#ffd670",
+  "Microbiome"         = "#82c0cc",
+  "Random: individual" = "#f2e8cf"
+)
+# palette / order consistency check
+stopifnot(setequal(names(vp_colors), category_order),
+          setequal(unique(category_table$category), category_order))
+
+vp_triangle <- vp_group %>%
+  left_join(category_table, by = "component") %>%
+  group_by(category) %>%
+  summarise(variance = sum(variance_weight), .groups = "drop") %>%
+  mutate(category = factor(category, levels = category_order)) %>%
+  arrange(category) %>%
+  mutate(label = percent(variance, accuracy = 0.1))
+
+g2 <- ggplot(vp_triangle, aes(x = "", y = variance, fill = category)) +
+  geom_col(width = 1, color = "white", size = 0.5) +
+  geom_text(aes(x = 1.25, label = label),          # nudged outward (toward 1.5 = outer edge)
+            position = position_stack(vjust = 0.5),
+            size = 5, color = "black") +            
+  coord_polar(theta = "y", start = 0) +
+  scale_fill_manual(values = vp_colors) +
+  theme_void(base_size = 14) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "right",
+    legend.text  = element_text(size = 12),         
+    legend.key.size = unit(0.9, "cm"),             
+    legend.spacing.y = unit(0.3, "cm"),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16)
+  )
+
+# save_fig(g2, "../results/vp_group2.pdf", width = 4, height = 2.5)
+
+g2
+```
+
+
+## Parasite associations
+```{r}
+# --------------------------------------------------------------------
+# Parasite associations (residual co-occurrence) + test:
+#   do nematodes associate more among themselves than protozoa?
+# --------------------------------------------------------------------
+
+## --- associations from HMSC (individual random level = [[2]]) ---
+Associations  <- result_hmsc$Omega
+Omega_mean    <- Associations[[2]]$mean
+Omega_support <- Associations[[2]]$support
+
+type_order <- c("Protozoa", "Nematode")
+
+lab_df <- parasite_metadata %>%
+  distinct(final_id, type) %>%
+  mutate(type = factor(type, levels = type_order)) %>%
+  arrange(type, final_id)
+
+parasite_labels <- setNames(
+  paste0("<span style='color:", tax_colors[as.character(lab_df$type)], "'>",
+         lab_df$final_id, "</span>"),
+  lab_df$final_id)
+
+otu_order        <- lab_df %>% pull(final_id)
+otu_order_in_mat <- otu_order[otu_order %in% rownames(Omega_mean)]
+
+Omega_mean    <- Omega_mean[otu_order_in_mat, otu_order_in_mat, drop = FALSE]
+Omega_support <- Omega_support[otu_order_in_mat, otu_order_in_mat, drop = FALSE]
+
+# display filter: keep well-supported associations (same threshold used elsewhere)
+Omega_filtered <- ifelse(Omega_support >= post_top | Omega_support <= post_bottom, Omega_mean, NA_real_)
+
+# melt and tag each cell: "shown" = strict lower triangle; "masked" = upper triangle + diagonal
+Omega_melt <- reshape2::melt(Omega_filtered, varnames = c("otu_y", "otu_x"), value.name = "value") %>%
+  mutate(i = match(otu_y, otu_order_in_mat),
+         j = match(otu_x, otu_order_in_mat),
+         region      = ifelse(i > j, "shown", "masked"),
+         value_shown = ifelse(region == "shown", value, NA_real_),
+         otu_x = factor(otu_x, levels = otu_order_in_mat),
+         otu_y = factor(otu_y, levels = otu_order_in_mat))
+masked_df <- subset(Omega_melt, region == "masked")   # upper triangle + diagonal -> soft grey
+shown_df  <- subset(Omega_melt, region == "shown")     # lower triangle -> value / white if unsupported
+
+sep_df <- lab_df %>% filter(final_id %in% otu_order_in_mat) %>% count(type) %>% mutate(cum_n = cumsum(n))
+boundaries <- sep_df$cum_n + 0.5
+boundaries <- boundaries[boundaries < length(otu_order_in_mat) + 0.5]
+
+g_assoc <- ggplot(mapping = aes(x = otu_x, y = otu_y)) +
+  geom_tile(data = masked_df, fill = "grey90", color = NA) +                 # not-shown region
+  geom_tile(data = shown_df, aes(fill = value_shown), color = "grey60") +    # shown associations
+  geom_vline(xintercept = boundaries, color = "black", linewidth = 0.6) +
+  geom_hline(yintercept = boundaries, color = "black", linewidth = 0.6) +
+  scale_fill_gradient2(low = "#6247aa", mid = "white", high = "#d00000",
+                       midpoint = 0, limits = c(-1, 1), na.value = "white",
+                       name = "Posterior Mean\nAssociation") +
+  scale_x_discrete(labels = parasite_labels, drop = FALSE) +
+  scale_y_discrete(labels = parasite_labels, drop = FALSE) +
+  coord_fixed() +
+  theme_bw() +
+  theme(axis.text.x = element_markdown(angle = 90, hjust = 1, vjust = 0.5),
+        axis.text.y = element_markdown(),
+        axis.title = element_text(face = "bold", size = 13),
+        legend.title = element_text(face = "bold", size = 10),
+        panel.grid = element_blank()) +
+  labs(x = "Parasites", y = "Parasites")
+
+# save_fig(g_assoc, "../results/assoc_network.pdf", width = 7, height = 5)
+g_assoc
+
+# --------------------------------------------------------------------
+# TEST: within-type vs between-type association strength (per posterior draw)
+#   uses ALL pairs on the RAW associations (not the display-filtered matrix),
+#   so uncertainty is propagated correctly.
+# --------------------------------------------------------------------
+hM   <- result_hmsc$model
+post <- Hmsc::poolMcmcChains(hM$postList)
+lvl  <- 2                                   # individual random level (matches Associations[[2]])
+sp   <- colnames(hM$Y)
+
+# per-draw residual correlation matrix at this level: cor from Lambda %*% t(Lambda)
+assoc_draws <- lapply(post, function(p) {
+  L <- p$Lambda[[lvl]]                       # nf x ns
+  A <- cov2cor(crossprod(L))                 # ns x ns correlation
+  dimnames(A) <- list(sp, sp)
+  A
+})
+
+type_vec <- parasite_metadata$type[match(sp, parasite_metadata$final_id)]
+is_nem <- type_vec == "Nematode"
+is_pro <- type_vec == "Protozoa"
+
+# masks for unique off-diagonal pairs of each block
+ut     <- upper.tri(matrix(0, length(sp), length(sp)))
+m_NN   <- ut & outer(is_nem, is_nem)
+m_PP   <- ut & outer(is_pro, is_pro)
+m_NP   <- ut & (outer(is_nem, is_pro) | outer(is_pro, is_nem))
+
+block_means <- function(A) c(NN = mean(A[m_NN]), PP = mean(A[m_PP]), NP = mean(A[m_NP]))
+B <- t(sapply(assoc_draws, block_means))     # ndraws x 3
+
+qs <- function(v) sprintf("%.3f  95%% CrI [%.3f, %.3f]", mean(v), quantile(v,.025), quantile(v,.975))
+qc <- function(v) sprintf("%.3f  95%% CrI [%.3f, %.3f]  P(>0)=%.2f",
+                          mean(v), quantile(v,.025), quantile(v,.975), mean(v > 0))
+
+cat("=== Within/between-type residual associations (raw, all pairs) ===\n")
+cat(sprintf("  n pairs: NN(nem-nem)=%d  PP(pro-pro)=%d  NP(nem-pro)=%d\n",
+            sum(m_NN), sum(m_PP), sum(m_NP)))
+cat("  Mean association per block:\n")
+cat("    Nematode-Nematode :", qs(B[,"NN"]), "\n")
+cat("    Protozoa-Protozoa :", qs(B[,"PP"]), "\n")
+cat("    Nematode-Protozoa :", qs(B[,"NP"]), "\n\n")
+cat("  Contrasts (per draw):\n")
+cat("    NN - PP :", qc(B[,"NN"] - B[,"PP"]), "  <- nematodes vs protozoa within-type\n")
+cat("    NN - NP :", qc(B[,"NN"] - B[,"NP"]), "  <- nematode within-type vs across-type\n")
+```

@@ -1,0 +1,283 @@
+---
+title: "Disease pyramid"
+subtitle: "Exploration analysis"
+author: "Matan Markfeld"
+date: "Last edit: 2026-08-24"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    collapse: false
+    number_sections: true
+    code_folding: hide
+    highlight: tango
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(results = "asis", message=FALSE, warning=FALSE, cache=TRUE, eval = TRUE, dev = c('png'), out.width = '100%', out.height='100%')
+```
+
+
+```{r load libraries, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(magrittr)
+library(ggplot2)
+library(tidytext)
+library(vegan)
+library(reshape2)
+library(RColorBrewer)
+library(ggtext)
+library(viridis)
+
+rm(list=ls())
+```
+
+# Data
+
+```{r}
+# reading parasite data
+
+data_parasites <- read_csv("../data/data_processed/parasites_long_10_lulu.csv")
+```
+
+
+# Small mammals
+
+```{r}
+# number of individuals
+data_parasites %>% 
+  group_by(host_species) %>% 
+  summarise(n = n_distinct(host_ID))
+
+# recode and order land-use types
+host_grid_n <- data_parasites %>%
+  mutate(
+    land_use = dplyr::recode(
+      grid,
+      "brushy_regrowth" = "Savoka",
+      "agriculture" = "Mixed agriculture",
+      "village" = "Village",
+      "secondary_forest" = "Secondary forest",
+      "flooded_rice" = "Flooded rice",
+      "agroforest" = "Agroforest",
+      "semi-intact_forest" = "Semi-intact forest"
+    ),
+    land_use = factor(
+      land_use,
+      levels = c(
+        "Semi-intact forest", "Secondary forest", "Savoka",
+        "Mixed agriculture", "Agroforest", "Flooded rice", "Village"
+      )
+    )
+  ) %>%
+  group_by(host_species, land_use) %>%
+  summarise(
+    n_hosts = n_distinct(host_ID),
+    .groups = "drop"
+  )
+
+# plotting
+g_hosts_grid <- ggplot(
+  host_grid_n,
+  aes(x = land_use, y = n_hosts, fill = host_species)
+) +
+  geom_col(
+    position = position_dodge(width = 0.72),
+    width = 0.68,
+    color = "black",
+    linewidth = 0.25
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Microgale brevicaudata" = "#0a9396",  # teal
+      "Rattus rattus" = "#fb8500"
+    ),
+    name = "Host species"
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    x = "Land Use Type",
+    y = "Number of Hosts"
+  ) +
+  theme_classic() +
+  theme(
+    aspect.ratio = 0.8,
+    axis.title = element_text(size = 15, face = "bold"),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.text.x = element_text(angle = 50, hjust = 1),
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 11),
+    legend.position = "right",
+    panel.grid = element_blank()
+  )
+
+
+
+#pdf('../results/sm_distribution.pdf')
+g_hosts_grid
+#dev.off()
+```
+
+
+# Parasites
+
+## Number of parasites
+
+```{r}
+# total number of parasites
+data_parasites %>% 
+  group_by(type) %>% 
+  summarise(n = n_distinct(final_id))
+
+# total number of parasites by host species
+data_parasites %>% 
+  group_by(host_species, type) %>% 
+  summarise(n = n_distinct(final_id))
+```
+
+## Parasite prevalence
+```{r}
+# Calculate prevalence by host species
+prev_df <- data_parasites %>%
+  group_by(host_species) %>%
+  mutate(n_hosts = n_distinct(host_ID)) %>%             # hosts sampled per species
+  group_by(host_species, final_id, type) %>%
+  summarise(
+    n_pos = sum(link),
+    prevalence = n_pos / n_hosts,
+    .groups = "drop"
+  ) %>%
+  distinct(host_species, final_id, type, prevalence,n_pos)
+
+prev_df_plot <- prev_df %>%
+  ungroup() %>%
+  mutate(final_id = as.character(final_id)) %>%
+  mutate(
+    # reorder WITHIN each species
+    otu_sorted = reorder_within(final_id, -prevalence, host_species)
+  )
+
+# plotting 
+ggplot(prev_df_plot, aes(x = otu_sorted, y = prevalence, fill = type)) +
+  geom_col() +
+  facet_wrap(~ host_species, scales = "free_x") +
+  scale_x_reordered() +
+  labs(
+    x = "OTU",
+    y = "Prevalence",
+    fill = "Parasite type"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6))
+
+```
+
+```{r}
+# choose colors per taxonomic group
+tax_colors <- c(
+  "Nematode" = "#023e8a",
+  "Protozoa" = "#7f5539"
+)
+
+
+# Create the named vector of HTML labels
+parasite_labels <- setNames(
+  paste0(
+    "<span style='color:", tax_colors[prev_df$type], "'>",
+    prev_df$final_id, # This is the visible colored text
+    "</span>"
+  ),
+  prev_df$final_id
+)
+
+
+#  Plotting 
+
+g <- prev_df %>%
+  mutate(host_species_s = ifelse(host_species=="Rattus rattus", "R. rattus", "M. brevicaudata")) %>% 
+  ggplot(aes(x = host_species_s, y = final_id, fill = prevalence)) +
+  geom_tile(color = "white", linewidth = 0.1) + 
+  scale_fill_viridis_c(
+    option = "viridis",                          
+    direction = 1, 
+    trans = "sqrt", 
+    name = "Prevalence",
+    labels = scales::percent_format(accuracy = 1),
+    breaks = c(0.01, 0.05, 0.10, 0.25, 0.50, 0.75)
+  ) +
+  scale_y_discrete(labels = parasite_labels) +
+  guides(fill = guide_colorbar(barheight = unit(8, "cm"))) +   
+  theme_bw() + 
+  theme(
+    axis.text.y = element_markdown(size = 10), 
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11, face = "italic", color = "black"),
+    axis.title = element_text(size = 14, face = "bold"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    legend.position = "right",
+    aspect.ratio = 2
+  ) +
+  labs(x = "", y = "Parasites") +
+  scale_x_discrete(expand = c(0, 0))
+
+#pdf('../results/prevalence.pdf')
+g
+#dev.off()
+```
+
+
+## Parasite richness
+```{r}
+# number of parasite per individual by host species
+richness_df <- data_parasites %>%
+  group_by(host_ID, host_species) %>%
+  summarise(n = sum(link))
+
+# plotting
+#pdf('../results/coinfection_dist.pdf')
+richness_df %>% 
+  ggplot(aes(x = n)) +
+  geom_histogram(binwidth = 1, center = 0, fill = "steelblue") +
+  scale_x_continuous(breaks = seq(0, max(richness_df$n, na.rm = TRUE), by = 1)) +
+  facet_wrap(~host_species) +
+  labs(x = "Number of Parasites", y = "Number of Hosts") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 14),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text = element_text(size = 12, color = "black"),
+    strip.text = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    aspect.ratio = 0.8,
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 1)
+  )
+#dev.off()
+
+
+# average number of parasite per individual
+
+richness_df %>% 
+  ggplot(aes(x = host_species, y = n)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7, alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1.8) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 23,
+    size = 3,
+    fill = "red",
+    color = "black"
+  ) +
+  expand_limits(y = 0) +
+  labs(
+    x = "Host species",
+    y = "Mean parasite richness"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
